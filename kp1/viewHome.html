@@ -64,7 +64,7 @@ body {
 </head>
 
 <body>
-<div>
+<div id="viewerShell">
   <!-- Copy the following canvas and components in your page, changing their size / texts and other values if needed  -->
   <canvas id="viewerCanvas" class="viewerComponent" width="800" height="600"
           style="background-color: #CCCCCC; border: 1px solid gray; outline:none" tabIndex="1"></canvas>
@@ -79,6 +79,11 @@ body {
       <label class="viewerComponent" for="virtualVisit" style="visibility: hidden;">Virtual visit</label>
     <select id="levelsAndCameras" class="viewerComponent" style="visibility: hidden;"></select>
   </div>
+<!-- Fullscreen toggle (top-right INSIDE the viewer) -->
+<button id="fsCornerBtn" aria-label="Toggle Fullscreen" title="Toggle Fullscreen">⛶</button>
+
+<!-- Resize handle (bottom-right) -->
+<div id="viewerResizeHandle" aria-label="Resize viewport" title="Drag to resize"></div>
 </div>
 <div style="position: absolute; bottom: 5px; text-align: center; width: 95%; z-index: -1">
   <a href="http://www.sweethome3d.com">Sweet Home 3D</a> HTML5 Viewer / Version 1.6 - Distributed under GNU General Public License
@@ -136,6 +141,230 @@ body {
            activateCameraSwitchKey: true                        // Switch between top view / virtual visit with space bar if not false or missing */
           });  
 </script>
+		  
+		  
+<style>
+  :root{
+    /* Default size: 66% of viewport */
+    --vp-w: 66vw;
+    --vp-h: 66vh;
+    --vp-min-w: 420px;
+    --vp-min-h: 320px;
+
+    --fs-fade: 2s;     /* idle time to fade out the FS button */
+    --fs-opacity: 0.35;/* idle opacity before fade to 0 */
+  }
+
+  html, body { height: 100%; margin: 0; overflow: hidden; background: #0e0e10; }
+
+  /* Centered, resizable shell */
+  #viewerShell{
+    position: fixed; left: 50%; top: 50%;
+    width: var(--vp-w); height: var(--vp-h);
+    transform: translate(-50%, -50%);
+    display: grid; place-items: stretch;
+    background: #1a1a1d;
+    border: 1px solid #2a2a2f;
+    border-radius: 14px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.45);
+    overflow: hidden;
+  }
+
+  /* Canvas fills the shell */
+  #viewerCanvas{ width: 100% !important; height: 100% !important; display: block; }
+
+  /* Keep progress + nav anchored */
+  #viewerProgressDiv{
+    position: absolute !important; left: 50% !important; top: 50% !important;
+    transform: translate(-50%, -50%); z-index: 10;
+  }
+  #viewerNavigationDiv{
+    position: absolute !important; bottom: 8px; left: 8px; margin: 0 !important; z-index: 5;
+  }
+
+  /* Fullscreen toggle — top-right INSIDE the viewer */
+  #fsCornerBtn{
+    position: absolute; top: 8px; right: 8px; z-index: 15;
+    width: 36px; height: 36px; display: grid; place-items: center;
+    border: 0; border-radius: 10px;
+    background: rgba(255,255,255,.85);
+    color: #111; font: 16px/1 system-ui, sans-serif; cursor: pointer;
+    opacity: var(--fs-opacity); transition: opacity .2s ease;
+  }
+  #fsCornerBtn:hover{ opacity: 1; }
+  #fsCornerBtn.fs-hidden{ opacity: 0; pointer-events: none; } /* fade after idle */
+
+  /* Resize handle — clear two-way diagonal arrow (bottom-right) */
+  #viewerResizeHandle{
+    position: absolute; right: 8px; bottom: 8px; z-index: 14;
+    width: 28px; height: 28px; border-radius: 8px;
+    background: rgba(0,0,0,.25);
+    backdrop-filter: blur(2px);
+    cursor: nwse-resize;
+    display: grid; place-items: center;
+  }
+  #viewerResizeHandle::before{
+    content: "";
+    width: 16px; height: 16px;
+    background-repeat: no-repeat; background-position: center; background-size: 16px 16px;
+    /* simple SVG for ↘︎↖︎ arrow icon */
+    background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><g stroke="%23ffffff" stroke-width="2" stroke-linecap="round"><path d="M2,14 L14,2"/><path d="M10,2 h4 v4"/></g></svg>');
+    opacity: .9;
+  }
+  #viewerResizeHandle:hover{ background: rgba(0,0,0,.35); }
+
+  /* Hide resize handle in fullscreen */
+  :fullscreen #viewerResizeHandle, :-webkit-full-screen #viewerResizeHandle{ display: none; }
+
+  /* Fullscreen sizing */
+  :fullscreen #viewerShell, :-webkit-full-screen #viewerShell{
+    inset: 0 !important; left: 0 !important; top: 0 !important; transform: none !important;
+    width: 100vw !important; height: 100vh !important; border-radius: 0; border: 0; box-shadow: none;
+  }
+  :fullscreen #viewerCanvas, :-webkit-full-screen #viewerCanvas{
+    width: 100vw !important; height: 100vh !important;
+  }
+
+  /* Ensure SH3D internals stretch in fullscreen too */
+  :fullscreen .content, :fullscreen canvas, :fullscreen #viewer, :fullscreen #homePane{ width:100vw !important; height:100vh !important; }
+  :-webkit-full-screen .content, :-webkit-full-screen canvas, :-webkit-full-screen #viewer, :-webkit-full-screen #homePane{ width:100vw !important; height:100vh !important; }
+</style>
+<script>
+(function(){
+  const d = document;
+  const shell  = d.getElementById('viewerShell');
+  const canvas = d.getElementById('viewerCanvas');
+  const corner = d.getElementById('fsCornerBtn');
+  const handle = d.getElementById('viewerResizeHandle');
+
+  /* ---------- Fullscreen helpers ---------- */
+  const reqfs  = el => (el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen)?.call(el, { navigationUI:"hide" });
+  const exitfs = () => (d.exitFullscreen || d.webkitExitFullscreen || d.mozCancelFullScreen || d.msExitFullscreen)?.call(d);
+  const isfs   = () => d.fullscreenElement || d.webkitFullscreenElement || d.mozFullScreenElement || d.msFullscreenElement;
+  const target = shell;
+
+  function updateFsIcon(){
+    corner.textContent = isfs() ? '×' : '⛶';
+    corner.title = isfs() ? 'Exit Fullscreen' : 'Enter Fullscreen';
+    corner.setAttribute('aria-label', corner.title);
+  }
+
+  function toggleFS(){ isfs() ? exitfs() : reqfs(target); }
+
+  corner.addEventListener('click', toggleFS);
+  d.addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'f'){ e.preventDefault(); toggleFS(); }
+  });
+
+  /* ---------- Default size: 66% on load, and whenever exiting fullscreen ---------- */
+  function setSizeToTwoThirds(){
+    // 66% of current viewport, clamped to min sizes
+    const minW = parseInt(getComputedStyle(d.documentElement).getPropertyValue('--vp-min-w')) || 420;
+    const minH = parseInt(getComputedStyle(d.documentElement).getPropertyValue('--vp-min-h')) || 320;
+    const w = Math.max(minW, Math.round(window.innerWidth  * 0.66));
+    const h = Math.max(minH, Math.round(window.innerHeight * 0.66));
+    d.documentElement.style.setProperty('--vp-w', w + 'px');
+    d.documentElement.style.setProperty('--vp-h', h + 'px');
+  }
+
+  // On load, force 66%
+  setSizeToTwoThirds();
+
+  // When FS state changes: update icon; if *exiting*, reset to 66%
+  d.addEventListener('fullscreenchange', () => {
+    if (!isfs()) setSizeToTwoThirds();
+    updateFsIcon();
+  });
+
+  /* ---------- Inactivity fade for the FS button ---------- */
+  let fadeTimer = null;
+  const FADE_MS = 2000; // match --fs-fade intent
+
+  function showCornerTransient(){
+    corner.classList.remove('fs-hidden');
+    if (fadeTimer) clearTimeout(fadeTimer);
+    fadeTimer = setTimeout(() => corner.classList.add('fs-hidden'), FADE_MS);
+  }
+
+  // Consider interactions inside the shell (plus window resize)
+  ['mousemove','mousedown','touchstart','wheel','keydown','resize'].forEach(evt => {
+    (evt === 'resize' ? window : shell).addEventListener(evt, showCornerTransient, { passive: true });
+  });
+  // Start visible briefly, then fade
+  showCornerTransient();
+
+  /* ---------- Resizable behavior (bottom-right handle) ---------- */
+  const css = getComputedStyle(d.documentElement);
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+  function applySize(w, h){
+    const minW = parseInt(css.getPropertyValue('--vp-min-w')) || 420;
+    const minH = parseInt(css.getPropertyValue('--vp-min-h')) || 320;
+    const maxW = Math.max(minW, Math.floor(window.innerWidth  * 0.98));
+    const maxH = Math.max(minH, Math.floor(window.innerHeight * 0.98));
+    w = clamp(w, minW, maxW); h = clamp(h, minH, maxH);
+    d.documentElement.style.setProperty('--vp-w', w + 'px');
+    d.documentElement.style.setProperty('--vp-h', h + 'px');
+  }
+
+  (function enableResize(){
+    let startX, startY, startW, startH, keepAspect = false, aspect = 1, dragging = false;
+
+    function pointerDown(e){
+      if (isfs()) return; // no resize in fullscreen (handle is hidden anyway)
+      dragging = true;
+      startX = (e.touches?.[0]?.clientX ?? e.clientX);
+      startY = (e.touches?.[0]?.clientY ?? e.clientY);
+      const rect = shell.getBoundingClientRect();
+      startW = rect.width; startH = rect.height; aspect = startW / startH;
+      keepAspect = e.shiftKey === true;
+
+      d.addEventListener('pointermove', pointerMove);
+      d.addEventListener('pointerup',   pointerUp, { once: true });
+      d.addEventListener('touchmove',   touchMove, { passive: false });
+      d.addEventListener('touchend',    pointerUp, { once: true });
+    }
+
+    function pointerMove(e){
+      if (!dragging) return;
+      const x = e.clientX, y = e.clientY;
+      const dx = x - startX, dy = y - startY;
+      let w = startW + dx, h = startH + dy;
+      if (keepAspect){
+        if (Math.abs(dx) > Math.abs(dy)) h = w / aspect;
+        else w = h * aspect;
+      }
+      applySize(Math.round(w), Math.round(h));
+    }
+
+    function touchMove(e){
+      if (!dragging) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      pointerMove({ clientX: t.clientX, clientY: t.clientY });
+    }
+
+    function pointerUp(){
+      dragging = false;
+      d.removeEventListener('pointermove', pointerMove);
+      d.removeEventListener('touchmove',   touchMove);
+    }
+
+    handle.addEventListener('pointerdown', (e) => { e.preventDefault(); handle.setPointerCapture?.(e.pointerId); pointerDown(e); });
+    handle.addEventListener('touchstart',  (e) => { e.preventDefault(); pointerDown(e); }, { passive: false });
+
+    // Re-clamp on window resize so the shell never overflows the viewport
+    window.addEventListener('resize', () => {
+      const rect = shell.getBoundingClientRect();
+      applySize(rect.width, rect.height);
+    });
+  })();
+
+  updateFsIcon();
+})();
+</script>
+
+
 
 </body>
 </html>
